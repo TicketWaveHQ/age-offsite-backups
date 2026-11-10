@@ -1,0 +1,19 @@
+# verify.conf on the RECOVERY MACHINE (read by backup-verify --config).
+#
+# Same format as backup.conf. Every value below is an example.
+
+BACKUP_BACKEND=aws
+BACKUP_BUCKET=my-backups-bucket
+BACKUP_S3_ENDPOINT=https://s3.example.com
+
+# A profile whose credentials can list and READ the bucket, and nothing
+# more: it cannot write or delete.
+AWS_PROFILE=offsite-reader
+AWS_REGION=eu-west-1
+
+# Optional: where the private key is, if you do not pass --identity or
+# --identity-stdin. Keep it on encrypted or removable storage, or a tmpfs.
+# BACKUP_IDENTITY_FILE=/media/restore-key/restore-key-1.txt
+
+# Objects checked in parallel.
+BACKUP_VERIFY_JOBS=4

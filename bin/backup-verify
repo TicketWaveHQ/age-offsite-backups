@@ -1,0 +1,322 @@
+#!/usr/bin/env bash
+# backup-verify: prove that every encrypted backup decrypts, and decrypts to
+# exactly the bytes that were backed up.
+#
+# Run it on a recovery machine, never on the backup host: this is where
+# decryption would happen in a real recovery, so this is where it must be
+# proved to work. It needs a private key and storage credentials that can
+# list and read. It reads and compares; it never writes, replaces or
+# deletes anything in storage.
+#
+# For every <name>.age it downloads the object, decrypts it with age and
+# hashes the result, streaming: decrypted data is never written to disk.
+# The hash is compared with the one backup-push stored, encrypted, in
+# .<name>.sha256.age. Where there is no checksum but a plaintext <name> is
+# stored (an archive from before encryption), it is compared with that.
+#
+# The private key is used where it is: --identity FILE reads it from a file
+# you choose (an encrypted volume, a tmpfs, removable media), and
+# --identity-stdin holds it in this process's memory and hands it to age
+# through a pipe, so it is never written to disk by this tool.
+#
+# Prints one line per object on standard output:
+#   OK <key>         decrypted, and the SHA-256 matches
+#   MISMATCH <key>   decrypted, but the SHA-256 differs
+#   ERROR <key>      could not be downloaded or decrypted
+#   NOSUM <key>      decrypts, but has nothing to compare it with
+#   MISSING <key>    a checksum is stored but the encrypted file is not
+# A header and the summary "backup-verify: N ok, M failed" go to stderr.
+# Exit status: 0 everything OK, 1 any failure or nothing found to verify,
+# 2 usage or configuration error.
+
+set -uo pipefail
+PROG=backup-verify
+
+aob_self="${BASH_SOURCE[0]}"
+while [ -L "$aob_self" ]; do
+    aob_link=$(readlink "$aob_self")
+    case "$aob_link" in
+        /*) aob_self="$aob_link" ;;
+        *) aob_self="$(dirname "$aob_self")/$aob_link" ;;
+    esac
+done
+AOB_LIB="$(cd "$(dirname "$aob_self")/../lib" 2>/dev/null && pwd)" || AOB_LIB=""
+if [ ! -r "$AOB_LIB/common.sh" ] || [ ! -r "$AOB_LIB/backends.sh" ]; then
+    echo "$PROG: cannot find lib/common.sh and lib/backends.sh next to bin/" >&2
+    exit 2
+fi
+# shellcheck source=../lib/common.sh
+. "$AOB_LIB/common.sh"
+# shellcheck source=../lib/backends.sh
+. "$AOB_LIB/backends.sh"
+
+usage() {
+    cat <<'EOF'
+Usage: backup-verify [--config FILE] (--identity FILE | --identity-stdin)
+                     [--jobs N] [PREFIX ...]
+
+Download, decrypt and check by SHA-256 every encrypted object under each
+PREFIX (default: everything in the bucket or remote).
+
+Options:
+  -c, --config FILE   read settings from FILE (default: $BACKUP_CONFIG, else
+                      /etc/age-offsite-backups/backup.conf if it exists)
+  -i, --identity FILE age identity (private key) file; or BACKUP_IDENTITY_FILE
+      --identity-stdin  read the identity from standard input and keep it in
+                      memory only, e.g.  age -d key.txt.age | backup-verify --identity-stdin
+  -j, --jobs N        objects checked in parallel (default: BACKUP_VERIFY_JOBS or 4)
+  -h, --help          show this help
+  -V, --version       show the version
+
+Storage settings are the same as for backup-push: BACKUP_BACKEND,
+BACKUP_BUCKET, BACKUP_S3_ENDPOINT, BACKUP_RCLONE_REMOTE, BACKUP_LOCAL_DIR.
+Use credentials that can list and read, and nothing more.
+
+Exit status: 0 everything OK, 1 any failure or nothing to verify,
+2 usage or configuration error.
+EOF
+}
+
+CONFIG=""
+ID_FILE=""
+ID_STDIN=0
+JOBS=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -c | --config)
+            [ $# -ge 2 ] || aob_usage_error "$1 needs a file"
+            CONFIG="$2"; shift 2 ;;
+        --config=*) CONFIG="${1#*=}"; shift ;;
+        -i | --identity)
+            [ $# -ge 2 ] || aob_usage_error "$1 needs a file"
+            ID_FILE="$2"; shift 2 ;;
+        --identity=*) ID_FILE="${1#*=}"; shift ;;
+        --identity-stdin) ID_STDIN=1; shift ;;
+        -j | --jobs)
+            [ $# -ge 2 ] || aob_usage_error "$1 needs a number"
+            JOBS="$2"; shift 2 ;;
+        --jobs=*) JOBS="${1#*=}"; shift ;;
+        -h | --help) usage; exit 0 ;;
+        -V | --version) echo "$PROG $AOB_VERSION"; exit 0 ;;
+        --) shift; break ;;
+        -*) aob_usage_error "unknown option: $1" ;;
+        *) break ;;
+    esac
+done
+
+aob_init_config "$CONFIG"
+[ -n "$JOBS" ] || JOBS="${BACKUP_VERIFY_JOBS:-4}"
+aob_is_uint "$JOBS" && [ "$JOBS" -ge 1 ] && [ "$JOBS" -le 64 ] ||
+    aob_usage_error "--jobs must be a whole number from 1 to 64"
+[ -n "$ID_FILE" ] || [ "$ID_STDIN" = 1 ] || ID_FILE="${BACKUP_IDENTITY_FILE:-}"
+
+# ---------------------------------------------------------------------------
+# The identity. Only lines that look like age identities are kept.
+
+AOB_IDENTITY=""
+AOB_IDENTITY_FILE=""
+if [ "$ID_STDIN" = 1 ]; then
+    [ -z "$ID_FILE" ] || aob_usage_error "use --identity or --identity-stdin, not both"
+    # The read builtin and printf below never put the key in a process's
+    # arguments, where other users could see it.
+    while IFS= read -r line || [ -n "$line" ]; do
+        line="${line%$'\r'}"
+        case "$line" in
+            AGE-SECRET-KEY-* | AGE-PLUGIN-*)
+                AOB_IDENTITY="$AOB_IDENTITY$line"$'\n' ;;
+        esac
+    done
+    line=""
+    [ -n "$AOB_IDENTITY" ] || aob_usage_error "no age identity on standard input (expected a line starting AGE-SECRET-KEY- or AGE-PLUGIN-)"
+elif [ -n "$ID_FILE" ]; then
+    [ -r "$ID_FILE" ] || aob_usage_error "cannot read identity file: $ID_FILE"
+    grep -q -E '^(AGE-SECRET-KEY-|AGE-PLUGIN-)' "$ID_FILE" ||
+        aob_usage_error "no age identity in $ID_FILE (expected a line starting AGE-SECRET-KEY- or AGE-PLUGIN-)"
+    AOB_IDENTITY_FILE="$ID_FILE"
+else
+    aob_usage_error "an identity is needed: --identity FILE, --identity-stdin or BACKUP_IDENTITY_FILE"
+fi
+exec </dev/null
+
+prefixes=()
+for p in "$@"; do
+    p="${p%/}"
+    aob_valid_prefix "$p" || aob_usage_error "not a valid prefix: '$p'"
+    prefixes+=("$p")
+done
+
+command -v "$BACKUP_AGE" >/dev/null 2>&1 || { aob_err "age ($BACKUP_AGE) is not installed"; exit 2; }
+aob_backend_check || exit 2
+aob_find_sha256 || exit 2
+
+umask 077
+AOB_WORK=$(mktemp -d "${TMPDIR:-/tmp}/backup-verify.XXXXXX") || { aob_err "cannot create a work directory"; exit 1; }
+AOB_WORK="${AOB_WORK%/}"
+trap 'rm -rf "$AOB_WORK"' EXIT
+
+# ---------------------------------------------------------------------------
+# Decrypt and hash, streaming.
+
+aob_decrypt() { # stdin -> stdout
+    if [ -n "$AOB_IDENTITY_FILE" ]; then
+        "$BACKUP_AGE" -d -i "$AOB_IDENTITY_FILE"
+    else
+        "$BACKUP_AGE" -d -i <(printf '%s' "$AOB_IDENTITY")
+    fi
+}
+
+# SHA-256 of the decrypted object; on failure prints the reason, returns 1.
+decrypted_sha() { # KEY
+    local res st_get st_age hash
+    res=$(aob_cat "$1" 2>/dev/null | aob_decrypt 2>/dev/null | aob_sha256
+        printf ' %s %s\n' "${PIPESTATUS[0]}" "${PIPESTATUS[1]}")
+    set -f
+    # shellcheck disable=SC2086
+    set -- $res
+    set +f
+    if [ $# -ne 3 ]; then
+        echo "could not hash"; return 1
+    fi
+    hash="$1" st_get="$2" st_age="$3"
+    if [ "$st_age" -ne 0 ]; then
+        # A reader cut off by age stopping early exits 141 (SIGPIPE).
+        if [ "$st_get" -eq 0 ] || [ "$st_get" -eq 141 ]; then
+            echo "could not decrypt"
+        else
+            echo "could not download"
+        fi
+        return 1
+    fi
+    if [ "$st_get" -ne 0 ]; then
+        echo "could not download"; return 1
+    fi
+    aob_is_sha256 "$hash" || { echo "could not hash"; return 1; }
+    printf '%s\n' "$hash"
+}
+
+# The SHA-256 recorded in a checksum object.
+recorded_sha() { # KEY
+    local text hash
+    text=$(aob_cat "$1" 2>/dev/null | aob_decrypt 2>/dev/null) || {
+        echo "could not read its checksum"; return 1
+    }
+    hash="${text%%[[:space:]]*}"
+    aob_is_sha256 "$hash" || { echo "its checksum object holds no SHA-256"; return 1; }
+    printf '%s\n' "$hash"
+}
+
+# SHA-256 of a stored plaintext original.
+plaintext_sha() { # KEY
+    local hash
+    hash=$(aob_cat "$1" 2>/dev/null | aob_sha256) || { echo "could not read the plaintext original"; return 1; }
+    aob_is_sha256 "$hash" || { echo "could not hash the plaintext original"; return 1; }
+    printf '%s\n' "$hash"
+}
+
+verify_one() { # METHOD BASE -> one report line
+    local method="$1" base="$2" key="$2.age" got want
+    if [ "$method" = missing ]; then
+        echo "MISSING $key (its checksum is stored, the encrypted file is not)"; return
+    fi
+    if ! got=$(decrypted_sha "$key"); then
+        echo "ERROR $key ($got)"; return
+    fi
+    if [ "$method" = none ]; then
+        echo "NOSUM $key (decrypts, but has no checksum or plaintext original to compare with)"
+    elif [ "$method" = sum ]; then
+        if ! want=$(recorded_sha "$(aob_sum_rel "$base").age"); then
+            echo "ERROR $key ($want)"; return
+        fi
+        if [ "$got" = "$want" ]; then echo "OK $key"; else echo "MISMATCH $key"; fi
+    else
+        if ! want=$(plaintext_sha "$base"); then
+            echo "ERROR $key ($want)"; return
+        fi
+        if [ "$got" = "$want" ]; then
+            echo "OK $key (compared with its plaintext original)"
+        else
+            echo "MISMATCH $key (differs from its plaintext original)"
+        fi
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# List and classify.
+
+: > "$AOB_WORK/keys"
+if [ "${#prefixes[@]}" -eq 0 ]; then
+    prefixes=("")
+fi
+for p in "${prefixes[@]}"; do
+    if ! aob_list "$p" > "$AOB_WORK/list"; then
+        if [ -n "$p" ]; then aob_err "could not list $p/"; else aob_err "could not list the storage"; fi
+        aob_show_err "$AOB_WORK/backend.err"
+        echo "$PROG: 0 ok, 1 failed" >&2
+        exit 1
+    fi
+    cut -f3- "$AOB_WORK/list" >> "$AOB_WORK/keys"
+done
+sort -u -o "$AOB_WORK/keys" "$AOB_WORK/keys"
+
+# D <base>: encrypted file <base>.age   S <base>: checksum of <base>
+# P <key>:  anything else, i.e. plaintext
+awk '{
+    key = $0
+    if (key !~ /\.age$/) { print "P\t" key; next }
+    b = key; sub(/.*\//, "", b); dir = substr(key, 1, length(key) - length(b))
+    if (substr(b, 1, 1) == "." && length(b) > 12 && b ~ /\.sha256\.age$/)
+        print "S\t" dir substr(b, 2, length(b) - 12)
+    else
+        print "D\t" substr(key, 1, length(key) - 4)
+}' "$AOB_WORK/keys" > "$AOB_WORK/classes"
+
+awk -F'\t' '
+    { kind[$2] = kind[$2] $1 }
+    END {
+        for (b in kind) {
+            k = kind[b]
+            if (k ~ /D/) print (k ~ /S/ ? "sum" : (k ~ /P/ ? "plain" : "none")) "\t" b
+            else if (k ~ /S/) print "missing\t" b
+        }
+    }' "$AOB_WORK/classes" | sort -t "$AOB_TAB" -k2 > "$AOB_WORK/plan"
+
+n_keys=$(wc -l < "$AOB_WORK/keys" | tr -d ' ')
+n_data=$(grep -c '^D' "$AOB_WORK/classes")
+n_sums=$(grep -c '^S' "$AOB_WORK/classes")
+n_plain=$(grep -c '^P' "$AOB_WORK/classes")
+n_plain_alone=$(awk -F'\t' '
+    $1 == "D" { d[$2] = 1 } $1 == "P" { p[$2] = 1 }
+    END { n = 0; for (k in p) if (!(k in d)) n++; print n }' "$AOB_WORK/classes")
+echo "objects: $n_keys; encrypted files: $n_data; checksums: $n_sums; plaintext: $n_plain, of which $n_plain_alone have no encrypted copy" >&2
+
+if [ ! -s "$AOB_WORK/plan" ]; then
+    aob_err "nothing to verify: no encrypted objects found"
+    echo "$PROG: 0 ok, 1 failed" >&2
+    exit 1
+fi
+
+# ---------------------------------------------------------------------------
+# Check, JOBS at a time, and report in key order.
+
+AOB_N="$JOBS" AOB_W="$AOB_WORK" awk '{
+    print NR "\t" $0 > (ENVIRON["AOB_W"] "/shard." ((NR - 1) % ENVIRON["AOB_N"]))
+}' "$AOB_WORK/plan"
+
+for shard in "$AOB_WORK"/shard.*; do
+    (
+        while IFS="$AOB_TAB" read -r idx method base; do
+            printf '%s\t%s\n' "$idx" "$(verify_one "$method" "$base")"
+        done < "$shard" > "$shard.out"
+    ) &
+done
+wait
+
+cat "$AOB_WORK"/shard.*.out | sort -n | cut -f2- > "$AOB_WORK/results"
+cat "$AOB_WORK/results"
+
+n_ok=$(grep -c '^OK ' "$AOB_WORK/results")
+n_total=$(wc -l < "$AOB_WORK/results" | tr -d ' ')
+n_bad=$((n_total - n_ok))
+echo "mismatch: $(grep -c '^MISMATCH ' "$AOB_WORK/results"); error: $(grep -c '^ERROR ' "$AOB_WORK/results"); no checksum: $(grep -c '^NOSUM ' "$AOB_WORK/results"); missing: $(grep -c '^MISSING ' "$AOB_WORK/results")" >&2
+echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] $PROG: $n_ok ok, $n_bad failed" >&2
+[ "$n_bad" -eq 0 ] && [ "$n_ok" -gt 0 ]

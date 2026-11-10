@@ -1,0 +1,111 @@
+#!/usr/bin/env bash
+# A stand-in for the AWS CLI, so the tests need no cloud account and no
+# network. It implements only the calls the toolkit makes:
+#
+#   aws [--endpoint-url URL] s3 ls s3://BUCKET/[PREFIX] --recursive
+#   aws [--endpoint-url URL] s3 cp DIR s3://BUCKET/PREFIX --recursive [...]
+#   aws [--endpoint-url URL] s3 cp s3://BUCKET/KEY - [...]
+#
+# Objects are files under $STUB_S3_ROOT/<bucket>/<key>; an object's
+# LastModified is the file's modification time. Every call is appended to
+# $STUB_S3_ROOT/calls.log.
+#
+# Fault injection, for the failure tests:
+#   STUB_AWS_FAIL=ls|cp|get  that operation fails, as a real error would
+#   STUB_AWS_TRUNCATE=1      uploads store only half of each file
+
+set -u
+root="${STUB_S3_ROOT:?STUB_S3_ROOT is not set}"
+printf '%s\n' "$*" >> "$root/calls.log"
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --endpoint-url) shift 2 ;;
+        --endpoint-url=*) shift ;;
+        *) break ;;
+    esac
+done
+[ "${1:-}" = s3 ] || { echo "stub aws: only 's3' is implemented" >&2; exit 2; }
+cmd="${2:-}"
+shift 2
+
+recursive=0
+args=()
+for a in "$@"; do
+    case "$a" in
+        --recursive) recursive=1 ;;
+        --no-progress | --only-show-errors) ;;
+        --*) echo "stub aws: unsupported option $a" >&2; exit 2 ;;
+        *) args+=("$a") ;;
+    esac
+done
+
+split_url() { # s3://bucket/key -> sets bucket, key
+    local rest="${1#s3://}"
+    bucket="${rest%%/*}"
+    key=""
+    case "$rest" in */*) key="${rest#*/}" ;; esac
+}
+
+case "$cmd" in
+    ls)
+        [ "${STUB_AWS_FAIL:-}" = ls ] && {
+            echo "An error occurred (AccessDenied) when calling the ListObjectsV2 operation: Access Denied" >&2
+            exit 1
+        }
+        [ "$recursive" = 1 ] || { echo "stub aws: ls is only implemented with --recursive" >&2; exit 2; }
+        split_url "${args[0]}"
+        [ -d "$root/$bucket" ] || {
+            echo "An error occurred (NoSuchBucket) when calling the ListObjectsV2 operation: The specified bucket does not exist" >&2
+            exit 254
+        }
+        found=0
+        while IFS= read -r -d '' f; do
+            k="${f#"$root/$bucket"/}"
+            case "$k" in "$key"*) ;; *) continue ;; esac
+            printf '%s %10s %s\n' "$(date -r "$f" '+%Y-%m-%d %H:%M:%S')" "$(wc -c < "$f" | tr -d ' ')" "$k"
+            found=1
+        done < <(find "$root/$bucket" -type f -print0 | sort -z)
+        # Like the real CLI: nothing found is exit 1 with nothing on stderr.
+        [ "$found" = 1 ] || exit 1
+        ;;
+    cp)
+        src="${args[0]:-}" dst="${args[1]:-}"
+        case "$src" in
+            s3://*)
+                [ "${STUB_AWS_FAIL:-}" = get ] && { echo "download failed: (AccessDenied)" >&2; exit 1; }
+                split_url "$src"
+                [ -f "$root/$bucket/$key" ] || {
+                    echo "fatal error: An error occurred (404) when calling the HeadObject operation: Key \"$key\" does not exist" >&2
+                    exit 1
+                }
+                [ "$dst" = - ] || { echo "stub aws: downloads are only implemented to -" >&2; exit 2; }
+                cat "$root/$bucket/$key"
+                ;;
+            *)
+                [ "${STUB_AWS_FAIL:-}" = cp ] && {
+                    # A credential-like string, to prove error output is redacted.
+                    echo "upload failed: An error occurred (SignatureDoesNotMatch) for key id STUBEXAMPLEKEYID0123456789abcdef" >&2
+                    exit 1
+                }
+                [ "$recursive" = 1 ] || { echo "stub aws: uploads are only implemented with --recursive" >&2; exit 2; }
+                split_url "$dst"
+                [ -d "$root/$bucket" ] || { echo "upload failed: NoSuchBucket" >&2; exit 1; }
+                (cd "$src" && find . -type f -print0) | while IFS= read -r -d '' f; do
+                    rel="${f#./}"
+                    out="$root/$bucket/${key:+$key/}$rel"
+                    mkdir -p "$(dirname "$out")"
+                    if [ "${STUB_AWS_TRUNCATE:-}" = 1 ]; then
+                        head -c "$(( $(wc -c < "$src/$rel") / 2 ))" "$src/$rel" > "$out"
+                    else
+                        cat "$src/$rel" > "$out"
+                    fi
+                done
+                ;;
+        esac
+        ;;
+    *)
+        echo "stub aws: s3 $cmd is not implemented" >&2
+        exit 2
+        ;;
+esac

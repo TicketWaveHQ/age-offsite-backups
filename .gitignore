@@ -1,0 +1,6 @@
+# Never commit key material or local configuration.
+*.agekey
+*key*.txt
+*key*.txt.age
+*.conf
+.DS_Store

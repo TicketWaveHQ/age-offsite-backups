@@ -1,0 +1,72 @@
+# /etc/age-offsite-backups/backup.conf on the BACKUP HOST (read by backup-push).
+#
+# KEY=VALUE lines. Whole-line comments only. The file is parsed, not
+# executed: no $VARIABLES, no $(commands). Settings in the environment win
+# over this file. Make it readable by the backup user only:
+#   chmod 600 /etc/age-offsite-backups/backup.conf
+#
+# Every value below is an example. Replace them with your own.
+
+# --- Storage ---------------------------------------------------------------
+
+# aws (the AWS CLI, default), rclone, or local
+BACKUP_BACKEND=aws
+
+# aws: the bucket name only, no s3:// and no path
+BACKUP_BUCKET=my-backups-bucket
+
+# aws: endpoint for S3-compatible storage; leave unset for AWS S3 itself
+BACKUP_S3_ENDPOINT=https://s3.example.com
+
+# aws: the AWS CLI reads its own credentials. Point it at a profile that
+# can list and write this bucket, and nothing more. Credentials do not go in
+# this file.
+AWS_PROFILE=offsite-writer
+AWS_REGION=eu-west-1
+
+# rclone instead: a configured remote and the bucket
+# BACKUP_BACKEND=rclone
+# BACKUP_RCLONE_REMOTE=offsite:my-backups-bucket
+# RCLONE_CONFIG=/etc/age-offsite-backups/rclone.conf
+
+# local instead: a mounted disk
+# BACKUP_BACKEND=local
+# BACKUP_LOCAL_DIR=/mnt/offsite-disk
+
+# --- What and where -----------------------------------------------------------
+
+# Key prefix for this machine. Objects land at
+#   <BACKUP_PREFIX><absolute source path>/<file>.age
+# Default: the short host name.
+BACKUP_PREFIX=backup-host-1
+
+# Directories to push when none are given on the command line, separated by
+# spaces. Pass directories whose names contain spaces as arguments instead.
+BACKUP_SOURCES=/srv/backups/postgres /srv/backups/files
+
+# --- Encryption ---------------------------------------------------------------
+
+# Public keys only, one per line. Two, held by different people or in
+# different places, so that either one restores on its own.
+BACKUP_RECIPIENTS_FILE=/etc/age-offsite-backups/recipients.txt
+
+# Refuse to run with fewer distinct recipients than this.
+BACKUP_MIN_RECIPIENTS=2
+
+# --- Behaviour ------------------------------------------------------------------
+
+# Leave files changed less than this many minutes ago for the next run.
+# Lower it only for files that are complete the moment they appear.
+BACKUP_SETTLE_MINUTES=15
+
+# Only if this prefix already holds plaintext from before you adopted this
+# tool: plaintext uploaded at or after this UTC time fails the run, older
+# plaintext is reported as a note. Leave unset and ANY plaintext fails.
+# BACKUP_ENCRYPTED_SINCE=2026-01-01 00:00:00
+
+# Encrypted copies are staged here before upload. Needs room for the largest
+# batch of new files. Holds ciphertext only.
+BACKUP_STAGING_DIR=/var/tmp
+
+# Written with the Unix time after every clean run. Alarm when it gets old.
+BACKUP_HEARTBEAT_FILE=/var/lib/age-offsite-backups/last-success

@@ -1,0 +1,14 @@
+# /etc/age-offsite-backups/recipients.txt on the BACKUP HOST.
+#
+# Public keys only: one age recipient per line, comments start with #.
+# Get each line by running, on the machine where that private key lives:
+#   age-keygen -y restore-key-1.txt
+# and paste the age1... output below. Never copy a line that starts
+# AGE-SECRET-KEY- onto the backup host; backup-push refuses to run if one
+# is here.
+#
+# Restore key 1: held by the person on call, on the recovery machine
+# age1...
+#
+# Restore key 2: offline copy, kept somewhere else
+# age1...

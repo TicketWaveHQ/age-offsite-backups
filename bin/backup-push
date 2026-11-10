@@ -1,0 +1,364 @@
+#!/usr/bin/env bash
+# backup-push: encrypt backup files with age, then upload them to object
+# storage. Runs on the machine that makes the backups.
+#
+# The rules it keeps:
+#
+# - Every file is encrypted HERE, to the public keys in the recipients file,
+#   before anything leaves the machine. This machine holds public keys only,
+#   so it can write backups it cannot read. With two recipients, either
+#   private key restores on its own.
+# - Each file is uploaded once, as <name>.age, with its SHA-256 beside it as
+#   .<name>.sha256.age, also encrypted. Anything already stored is skipped.
+#   Nothing remote is ever deleted or replaced.
+# - It fails CLOSED. Without age, or with a recipients file age cannot use,
+#   nothing is uploaded and the run fails. Plaintext is never the fallback.
+# - Files that may still be being written are left for the next run:
+#   anything changed in the last BACKUP_SETTLE_MINUTES, and dotfiles.
+# - Files are encrypted into a staging directory and uploaded from there,
+#   and every upload is checked at its exact size against a fresh listing.
+#   The upload command's exit status alone is not taken as proof.
+# - Finally it lists this machine's whole prefix and fails if any object
+#   there is not .age (or, with BACKUP_ENCRYPTED_SINCE, any uploaded since
+#   then). A return to plaintext becomes an alarm on the next run.
+#
+# Prints one line per source directory and ends with
+#   [<UTC time>] backup-push: N ok, M failed
+# Exit status: 0 all good, 1 any failure, 2 usage or configuration error.
+
+set -uo pipefail
+PROG=backup-push
+
+aob_self="${BASH_SOURCE[0]}"
+while [ -L "$aob_self" ]; do
+    aob_link=$(readlink "$aob_self")
+    case "$aob_link" in
+        /*) aob_self="$aob_link" ;;
+        *) aob_self="$(dirname "$aob_self")/$aob_link" ;;
+    esac
+done
+AOB_LIB="$(cd "$(dirname "$aob_self")/../lib" 2>/dev/null && pwd)" || AOB_LIB=""
+if [ ! -r "$AOB_LIB/common.sh" ] || [ ! -r "$AOB_LIB/backends.sh" ]; then
+    echo "$PROG: cannot find lib/common.sh and lib/backends.sh next to bin/" >&2
+    exit 2
+fi
+# shellcheck source=../lib/common.sh
+. "$AOB_LIB/common.sh"
+# shellcheck source=../lib/backends.sh
+. "$AOB_LIB/backends.sh"
+
+usage() {
+    cat <<'EOF'
+Usage: backup-push [--config FILE] [SOURCE_DIR ...]
+
+Encrypt every finished file under each SOURCE_DIR with age and upload it to
+object storage as <BACKUP_PREFIX><absolute path>/<file>.age, with its
+SHA-256 as .<file>.sha256.age. With no SOURCE_DIR, uses BACKUP_SOURCES.
+
+Options:
+  -c, --config FILE  read settings from FILE (default: $BACKUP_CONFIG, else
+                     /etc/age-offsite-backups/backup.conf if it exists)
+  -h, --help         show this help
+  -V, --version      show the version
+
+Settings (environment or config file; the environment wins):
+  BACKUP_BACKEND          aws (default), rclone or local
+  BACKUP_BUCKET           aws: bucket name, e.g. my-backups-bucket
+  BACKUP_S3_ENDPOINT      aws: endpoint URL for S3-compatible storage
+  BACKUP_RCLONE_REMOTE    rclone: remote and bucket, e.g. offsite:my-backups-bucket
+  BACKUP_LOCAL_DIR        local: target directory
+  BACKUP_PREFIX           key prefix for this machine (default: short host name)
+  BACKUP_RECIPIENTS_FILE  age recipients (default: /etc/age-offsite-backups/recipients.txt)
+  BACKUP_MIN_RECIPIENTS   refuse to run with fewer recipients (default: 2)
+  BACKUP_SETTLE_MINUTES   leave files changed more recently than this (default: 15)
+  BACKUP_ENCRYPTED_SINCE  "YYYY-MM-DD HH:MM:SS" UTC: only plaintext uploaded at or
+                          after this fails the run (default: any plaintext fails)
+  BACKUP_STAGING_DIR      where encrypted copies are staged (default: $TMPDIR or /var/tmp)
+  BACKUP_HEARTBEAT_FILE   written with the Unix time after a clean run (optional)
+  BACKUP_AGE              the age command (default: age)
+
+Exit status: 0 all good, 1 any failure, 2 usage or configuration error.
+EOF
+}
+
+CONFIG=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -c | --config)
+            [ $# -ge 2 ] || aob_usage_error "$1 needs a file"
+            CONFIG="$2"; shift 2 ;;
+        --config=*) CONFIG="${1#*=}"; shift ;;
+        -h | --help) usage; exit 0 ;;
+        -V | --version) echo "$PROG $AOB_VERSION"; exit 0 ;;
+        --) shift; break ;;
+        -*) aob_usage_error "unknown option: $1" ;;
+        *) break ;;
+    esac
+done
+
+aob_init_config "$CONFIG"
+: "${BACKUP_RECIPIENTS_FILE:=/etc/age-offsite-backups/recipients.txt}"
+: "${BACKUP_MIN_RECIPIENTS:=2}"
+: "${BACKUP_SETTLE_MINUTES:=15}"
+: "${BACKUP_ENCRYPTED_SINCE:=}"
+: "${BACKUP_HEARTBEAT_FILE:=}"
+if [ -z "${BACKUP_PREFIX:-}" ]; then
+    BACKUP_PREFIX="$(hostname -s 2>/dev/null || hostname)"
+fi
+
+aob_is_uint "$BACKUP_MIN_RECIPIENTS" && [ "$BACKUP_MIN_RECIPIENTS" -ge 1 ] ||
+    aob_usage_error "BACKUP_MIN_RECIPIENTS must be a whole number, 1 or more"
+aob_is_uint "$BACKUP_SETTLE_MINUTES" ||
+    aob_usage_error "BACKUP_SETTLE_MINUTES must be a whole number of minutes"
+aob_valid_prefix "$BACKUP_PREFIX" ||
+    aob_usage_error "BACKUP_PREFIX '$BACKUP_PREFIX' must not be empty, start or end with /, or contain //, . or .. parts"
+case "$BACKUP_ENCRYPTED_SINCE" in
+    '') ;;
+    [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9])
+        BACKUP_ENCRYPTED_SINCE="$BACKUP_ENCRYPTED_SINCE 00:00:00" ;;
+    [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]' '[0-9][0-9]:[0-9][0-9]:[0-9][0-9]) ;;
+    *) aob_usage_error "BACKUP_ENCRYPTED_SINCE must be YYYY-MM-DD or 'YYYY-MM-DD HH:MM:SS' (UTC)" ;;
+esac
+
+if [ $# -eq 0 ] && [ -n "${BACKUP_SOURCES:-}" ]; then
+    # Whitespace-separated; pass directories with spaces as arguments.
+    set -f
+    # shellcheck disable=SC2086
+    set -- $BACKUP_SOURCES
+    set +f
+fi
+[ $# -gt 0 ] || aob_usage_error "no source directories (give them as arguments or set BACKUP_SOURCES)"
+
+umask 077
+AOB_WORK=$(mktemp -d "${BACKUP_STAGING_DIR:-${TMPDIR:-/var/tmp}}/backup-push.XXXXXX") || {
+    aob_err "cannot create a staging directory"
+    exit 1
+}
+AOB_WORK="${AOB_WORK%/}"
+trap 'rm -rf "$AOB_WORK"' EXIT
+
+OK=0
+FAIL=0
+
+# ---------------------------------------------------------------------------
+# Fail closed: no age, no usable recipients, no upload.
+
+check_recipients() {
+    local f="$BACKUP_RECIPIENTS_FILE" n
+    if ! command -v "$BACKUP_AGE" >/dev/null 2>&1; then
+        aob_err "age ($BACKUP_AGE) is not installed: refusing to upload anything unencrypted"
+        return 1
+    fi
+    if [ ! -r "$f" ]; then
+        aob_err "recipients file $f is missing or unreadable: refusing to upload anything unencrypted"
+        return 1
+    fi
+    if grep -qi 'AGE-SECRET-KEY-' "$f"; then
+        aob_err "recipients file $f contains a private key. This machine must hold public keys only: remove it, and treat that key as exposed"
+        return 1
+    fi
+    if ! "$BACKUP_AGE" -R "$f" -o /dev/null </dev/null 2>"$AOB_WORK/age.err"; then
+        aob_err "age cannot use recipients file $f: refusing to upload anything unencrypted"
+        head -2 "$AOB_WORK/age.err" | sed 's/^/    /' >&2
+        return 1
+    fi
+    n=$(grep -E '^[[:space:]]*[^#[:space:]]' "$f" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//' | sort -u | wc -l | tr -d ' ')
+    if [ "$n" -lt "$BACKUP_MIN_RECIPIENTS" ]; then
+        aob_err "recipients file $f lists $n recipient(s); at least $BACKUP_MIN_RECIPIENTS are required (BACKUP_MIN_RECIPIENTS), so that losing one private key does not lose the backups"
+        return 1
+    fi
+}
+
+READY=1
+check_recipients || READY=0
+aob_backend_check || READY=0
+aob_find_sha256 || READY=0
+[ "$READY" = 1 ] || FAIL=$((FAIL + 1))
+
+# ---------------------------------------------------------------------------
+# One source directory.
+
+# Paths under DIR, relative to it, one per line, sorted: all regular files,
+# or (with MINUTES) only those changed less than MINUTES ago.
+relative_files() { # DIR [MINUTES]
+    local dir="$1" f
+    (
+        if [ -n "${2:-}" ]; then
+            find -H "$dir" -type f -mmin -"$2" -print0
+        else
+            find -H "$dir" -type f -print0
+        fi
+    ) | while IFS= read -r -d '' f; do
+        case "$f" in
+            *$'\n'*) printf 'NEWLINE\n' >&3 ;;
+            *) printf '%s\n' "${f#"$dir"/}" ;;
+        esac
+    done | sort
+}
+
+push_source() { # DIR
+    local src="$1" abs pfx what rel sumrel new=0 repaired=0 waiting=0 hidden=0 odd bad=0 total missing
+
+    if [ ! -d "$src" ]; then
+        aob_err "source directory not found: $src"
+        return 1
+    fi
+    abs=$(cd "$src" && pwd) || { aob_err "cannot enter $src"; return 1; }
+    pfx=$(printf '%s%s' "$BACKUP_PREFIX" "$abs" | tr -s '/')
+    pfx="${pfx%/}"
+
+    if ! aob_list "$pfx" > "$AOB_WORK/before"; then
+        aob_err "could not list $pfx/ in storage"
+        aob_show_err "$AOB_WORK/backend.err"
+        return 1
+    fi
+    cut -f3- "$AOB_WORK/before" > "$AOB_WORK/have"
+
+    relative_files "$abs" > "$AOB_WORK/files" 3>"$AOB_WORK/odd"
+    if [ "$BACKUP_SETTLE_MINUTES" -gt 0 ]; then
+        relative_files "$abs" "$BACKUP_SETTLE_MINUTES" > "$AOB_WORK/fresh" 3>/dev/null
+    else
+        : > "$AOB_WORK/fresh"
+    fi
+    odd=$(wc -l < "$AOB_WORK/odd" | tr -d ' ')
+    if [ "$odd" -gt 0 ]; then
+        aob_err "$odd file(s) under $abs have a newline in their name and were not uploaded; rename them"
+        bad=$((bad + 1))
+    fi
+
+    # Decide, for every file, what is still needed:
+    #   both  the encrypted file and its checksum
+    #   data  only the encrypted file (its checksum is already stored)
+    #   sum   only the checksum (the encrypted file is already stored)
+    #   wait  changed too recently: left for the next run
+    #   hidden a dotfile, or under a dot-directory: never uploaded
+    # Files with both objects stored are done and not listed.
+    AOB_P="$pfx" awk '
+        FILENAME == ARGV[1] { have[$0] = 1; next }
+        FILENAME == ARGV[2] { fresh[$0] = 1; next }
+        {
+            rel = $0
+            n = split(rel, part, "/")
+            for (i = 1; i <= n; i++)
+                if (substr(part[i], 1, 1) == ".") { print "hidden\t" rel; next }
+            dir = ""; base = rel
+            if (n > 1) { base = part[n]; dir = substr(rel, 1, length(rel) - length(base)) }
+            d = ((ENVIRON["AOB_P"] "/" rel ".age") in have)
+            s = ((ENVIRON["AOB_P"] "/" dir "." base ".sha256.age") in have)
+            if (d && s) next
+            if (rel in fresh) { print "wait\t" rel; next }
+            print (d ? "sum" : (s ? "data" : "both")) "\t" rel
+        }' "$AOB_WORK/have" "$AOB_WORK/fresh" "$AOB_WORK/files" > "$AOB_WORK/plan"
+
+    local stage="$AOB_WORK/stage" sum
+    rm -rf "$stage"
+    mkdir -p "$stage"
+    while IFS="$AOB_TAB" read -r what rel; do
+        case "$what" in
+            hidden) hidden=$((hidden + 1)); continue ;;
+            wait) waiting=$((waiting + 1)); continue ;;
+        esac
+        sumrel=$(aob_sum_rel "$rel")
+        mkdir -p "$stage/$(dirname "$rel")"
+        if [ "$what" != sum ]; then
+            if ! "$BACKUP_AGE" -R "$BACKUP_RECIPIENTS_FILE" -o "$stage/$rel.age" "$abs/$rel" 2>"$AOB_WORK/age.err"; then
+                aob_err "could not encrypt $abs/$rel"
+                head -2 "$AOB_WORK/age.err" | sed 's/^/    /' >&2
+                rm -f "$stage/$rel.age"
+                bad=$((bad + 1))
+                continue
+            fi
+        fi
+        if [ "$what" != data ]; then
+            sum=$(aob_sha256 < "$abs/$rel")
+            if ! aob_is_sha256 "$sum" ||
+                ! printf '%s  %s\n' "$sum" "${rel##*/}" |
+                "$BACKUP_AGE" -R "$BACKUP_RECIPIENTS_FILE" -o "$stage/$sumrel.age" 2>"$AOB_WORK/age.err"; then
+                aob_err "could not hash and encrypt the checksum of $abs/$rel"
+                rm -f "$stage/$rel.age" "$stage/$sumrel.age"
+                bad=$((bad + 1))
+                continue
+            fi
+        fi
+        if [ "$what" = sum ]; then repaired=$((repaired + 1)); else new=$((new + 1)); fi
+    done < "$AOB_WORK/plan"
+
+    total=$(wc -l < "$AOB_WORK/have" | tr -d ' ')
+    if [ -n "$(find "$stage" -type f -print 2>/dev/null | head -1)" ]; then
+        if ! aob_upload "$stage" "$pfx"; then
+            aob_err "upload failed for $abs"
+            aob_show_err "$AOB_WORK/backend.err"
+            bad=$((bad + 1))
+        fi
+        # Every staged file must now be stored at its exact size.
+        if aob_list "$pfx" > "$AOB_WORK/after"; then
+            awk -F'\t' -v OFS='\t' '{ print $3, $2 }' "$AOB_WORK/after" | sort > "$AOB_WORK/after.ks"
+            (cd "$stage" && find . -type f -print0) | while IFS= read -r -d '' f; do
+                printf '%s/%s\t%s\n' "$pfx" "${f#./}" "$(wc -c < "$stage/${f#./}" | tr -d ' ')"
+            done | sort > "$AOB_WORK/staged.ks"
+            missing=$(comm -23 "$AOB_WORK/staged.ks" "$AOB_WORK/after.ks" | wc -l | tr -d ' ')
+            if [ "$missing" -gt 0 ]; then
+                aob_err "$missing encrypted object(s) for $abs not found in storage at full size"
+                bad=$((bad + 1))
+            fi
+            total=$(wc -l < "$AOB_WORK/after" | tr -d ' ')
+        else
+            aob_err "could not list $pfx/ to confirm the upload"
+            aob_show_err "$AOB_WORK/backend.err"
+            bad=$((bad + 1))
+            total="?"
+        fi
+    fi
+
+    printf '  %s -> %s encrypted and uploaded' "$abs" "$new"
+    [ "$repaired" -eq 0 ] || printf ', %s missing checksum(s) added' "$repaired"
+    printf ', %s left for the next run' "$waiting"
+    [ "$hidden" -eq 0 ] || printf ', %s hidden skipped' "$hidden"
+    printf ', %s objects stored\n' "$total"
+    rm -rf "$stage"
+    [ "$bad" -eq 0 ]
+}
+
+if [ "$READY" = 1 ]; then
+    for SRC in "$@"; do
+        if push_source "$SRC"; then OK=$((OK + 1)); else FAIL=$((FAIL + 1)); fi
+    done
+fi
+
+# ---------------------------------------------------------------------------
+# Nothing under this machine's prefix may be plaintext.
+
+if [ "$READY" = 1 ]; then
+    if aob_list "$BACKUP_PREFIX" > "$AOB_WORK/all"; then
+        AOB_T="$BACKUP_ENCRYPTED_SINCE" awk -F'\t' '$3 !~ /\.age$/ && $1 >= ENVIRON["AOB_T"]' \
+            "$AOB_WORK/all" > "$AOB_WORK/plain.new"
+        AOB_T="$BACKUP_ENCRYPTED_SINCE" awk -F'\t' '$3 !~ /\.age$/ && $1 < ENVIRON["AOB_T"]' \
+            "$AOB_WORK/all" > "$AOB_WORK/plain.old"
+        if [ -s "$AOB_WORK/plain.new" ]; then
+            if [ -n "$BACKUP_ENCRYPTED_SINCE" ]; then
+                aob_err "$(wc -l < "$AOB_WORK/plain.new" | tr -d ' ') UNENCRYPTED object(s) under $BACKUP_PREFIX/ uploaded since $BACKUP_ENCRYPTED_SINCE UTC, for example:"
+            else
+                aob_err "$(wc -l < "$AOB_WORK/plain.new" | tr -d ' ') UNENCRYPTED object(s) under $BACKUP_PREFIX/, for example:"
+            fi
+            head -3 "$AOB_WORK/plain.new" | cut -f3- | sed 's/^/    /' >&2
+            FAIL=$((FAIL + 1))
+        fi
+        if [ -s "$AOB_WORK/plain.old" ]; then
+            echo "  note: $(wc -l < "$AOB_WORK/plain.old" | tr -d ' ') unencrypted object(s) from before $BACKUP_ENCRYPTED_SINCE UTC remain under $BACKUP_PREFIX/"
+        fi
+    else
+        aob_err "could not list $BACKUP_PREFIX/ to confirm that nothing there is unencrypted"
+        aob_show_err "$AOB_WORK/backend.err"
+        FAIL=$((FAIL + 1))
+    fi
+fi
+
+# Written only after a clean run, so its age means "time since the last
+# good push". Point a staleness alarm at it.
+if [ "$FAIL" -eq 0 ] && [ -n "$BACKUP_HEARTBEAT_FILE" ]; then
+    date -u +%s > "$BACKUP_HEARTBEAT_FILE" 2>/dev/null ||
+        aob_warn "could not write the heartbeat file $BACKUP_HEARTBEAT_FILE"
+fi
+
+echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] $PROG: $OK ok, $FAIL failed"
+[ "$FAIL" -eq 0 ]

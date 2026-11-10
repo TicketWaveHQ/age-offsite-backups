@@ -1,0 +1,24 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it using the metadata from this file."
+type: software
+title: "age-offsite-backups"
+abstract: >-
+  Bash toolkit that encrypts backup files with age on the backup host, to two
+  public keys, before uploading them to S3-compatible object storage, fails
+  closed rather than upload plaintext, and verifies on a separate machine that
+  every encrypted object decrypts to its original SHA-256.
+authors:
+  - name: "TicketWave HQ Ltd"
+    website: "https://ticketwavehq.com"
+version: "1.0.0"
+date-released: "2026-11-10"
+license: MIT
+repository-code: "https://github.com/TicketWaveHQ/age-offsite-backups"
+keywords:
+  - backup
+  - age
+  - encryption
+  - s3
+  - object-storage
+  - disaster-recovery
+  - bash

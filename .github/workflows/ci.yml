@@ -1,0 +1,39 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install age and rclone (Ubuntu)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y age rclone
+
+      - name: Install age and rclone (macOS)
+        if: runner.os == 'macOS'
+        run: brew install age rclone
+
+      - name: Versions
+        run: |
+          bash --version | head -1
+          age --version
+          rclone version | head -1
+
+      - name: Run the tests
+        run: tests/run.sh
